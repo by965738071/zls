@@ -1768,11 +1768,11 @@ fn findModuleRootInPackage(
 
             const abs_path = try std.Io.Dir.path.join(allocator, &.{ pkg_dir, relative_path });
             defer allocator.free(abs_path);
-            if (std.Io.Dir.cwd().access(self.io, abs_path, .{})) |_| {
-                return try .fromPath(allocator, abs_path);
-            } else |_| {
+            std.Io.Dir.cwd().access(self.io, abs_path, .{}) catch {
                 log.debug("module '{s}': declared root_source_file '{s}' does not exist", .{ module_name, abs_path });
-            }
+                continue;
+            };
+            return try .fromPath(allocator, abs_path);
         }
     }
     log.debug("module '{s}': no matching addModule call with a resolvable root_source_file in '{s}'", .{ module_name, build_zig_path });
@@ -1802,10 +1802,279 @@ fn guessPackageEntry(
     for (suffixes) |suffix| {
         const candidate = try std.Io.Dir.path.join(allocator, &.{ pkg_dir, suffix });
         defer allocator.free(candidate);
-        if (std.Io.Dir.cwd().access(self.io, candidate, .{})) |_| {
-            return try .fromPath(allocator, candidate);
-        } else |_| {}
+        std.Io.Dir.cwd().access(self.io, candidate, .{}) catch {
+            continue;
+        };
+        return try .fromPath(allocator, candidate);
     }
+    return null;
+}
+
+/// Returns true if `c` is a valid Zig identifier character.
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+}
+
+/// Finds `.field_name` in `source` starting from `search_start`, ensuring
+/// `field_name` is not a prefix of a longer identifier (word boundary check).
+/// Returns the byte offset of the leading `.`.
+fn findField(source: []const u8, field_name: []const u8, search_start: usize) ?usize {
+    var pos = search_start;
+    while (pos < source.len) {
+        const off = std.mem.indexOf(u8, source[pos..], field_name) orelse return null;
+        const found = pos + off;
+        // Must be preceded by '.'
+        if (found == 0 or source[found - 1] != '.') {
+            pos = found + 1;
+            continue;
+        }
+        // Must not be followed by an identifier char (word boundary)
+        const after = found + field_name.len;
+        if (after < source.len and isIdentChar(source[after])) {
+            pos = after;
+            continue;
+        }
+        return found - 1;
+    }
+    return null;
+}
+
+/// From `pos`, skips whitespace, expects `=`, skips whitespace.
+/// Returns the index of the first non-whitespace char after `=`, or null.
+fn skipToValue(source: []const u8, pos: usize) ?usize {
+    var i = pos;
+    while (i < source.len and std.ascii.isWhitespace(source[i])) i += 1;
+    if (i >= source.len or source[i] != '=') return null;
+    i += 1;
+    while (i < source.len and std.ascii.isWhitespace(source[i])) i += 1;
+    if (i >= source.len) return null;
+    return i;
+}
+
+/// Extracts a string literal value starting at `pos`.
+/// Handles both `"..."` and `b.path("...")` patterns.
+fn extractStringValue(source: []const u8, pos: usize) ?[]const u8 {
+    var i = pos;
+    // Check for b.path("...") pattern
+    if (i + 7 <= source.len and std.mem.eql(u8, source[i..i + 7], "b.path(")) {
+        i += 7;
+        while (i < source.len and std.ascii.isWhitespace(source[i])) i += 1;
+    }
+    if (i >= source.len or source[i] != '"') return null;
+    i += 1;
+    const start = i;
+    while (i < source.len and source[i] != '"') {
+        if (source[i] == '\\' and i + 1 < source.len) i += 1;
+        i += 1;
+    }
+    if (i >= source.len) return null;
+    return source[start..i];
+}
+
+/// Extracts an identifier starting at `pos`.
+fn extractIdentValue(source: []const u8, pos: usize) ?[]const u8 {
+    var i = pos;
+    while (i < source.len and isIdentChar(source[i])) i += 1;
+    if (i == pos) return null;
+    return source[pos..i];
+}
+
+/// String-based fallback that handles Zig 0.17's `b.createModule(...)` pattern
+/// where module names are defined in `.imports` lists, not in `addModule` calls.
+/// The AST-based `findModuleRootInPackage` only matches `addModule`, so this
+/// function bridges the gap by parsing `build.zig` as raw text.
+fn findModuleRootByStringSearch(
+    self: *DocumentStore,
+    allocator: std.mem.Allocator,
+    pkg_dir: []const u8,
+    module_name: []const u8,
+) error{ Canceled, OutOfMemory }!?Uri {
+    const build_zig_path = try std.Io.Dir.path.join(allocator, &.{ pkg_dir, "build.zig" });
+    defer allocator.free(build_zig_path);
+
+    const source = std.Io.Dir.cwd().readFileAllocOptions(self.io, build_zig_path, allocator, .limited(std.zig.max_src_size), .@"1", 0) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => return null,
+    };
+    defer allocator.free(source);
+
+    var pairs_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer pairs_arena.deinit();
+    const pa = pairs_arena.allocator();
+
+    const NamePath = struct { name: []const u8, path: []const u8 };
+    var var_to_path: std.ArrayList(NamePath) = .empty;
+    defer var_to_path.deinit(pa);
+
+    // Phase 1: Collect all createModule variable → root_source_file mappings.
+    // For each `identifier = b.createModule(.{` we record:
+    //   variable_name -> root_source_file path
+    {
+        var search_pos: usize = 0;
+        while (search_pos < source.len) {
+            const cm_offset = std.mem.indexOf(u8, source[search_pos..], "createModule(") orelse break;
+            const cm_start = search_pos + cm_offset;
+
+            // Extract variable name: walk backwards from cm_start to find `=`,
+            // skipping whitespace (including newlines) to support multi-line
+            // assignments like `const foo =\n    b.createModule(...)`.
+            var var_name: ?[]const u8 = null;
+            {
+                var back = cm_start;
+                while (back > 0) {
+                    back -= 1;
+                    const c = source[back];
+                    if (c == '=') {
+                        // Distinguish assignment '=' from comparison '=='
+                        if (back > 0 and source[back - 1] == '=') {
+                            back -= 1; // skip left '=' of '=='
+                            continue;
+                        }
+                        var id_end = back;
+                        while (id_end > 0 and std.ascii.isWhitespace(source[id_end - 1])) id_end -= 1;
+                        var id_start = id_end;
+                        while (id_start > 0 and isIdentChar(source[id_start - 1])) id_start -= 1;
+                        if (id_end > id_start) {
+                            var_name = source[id_start..id_end];
+                        }
+                        break;
+                    }
+                    // Skip whitespace (including newlines) when searching for '='
+                    if (std.ascii.isWhitespace(c)) continue;
+                    // Any other non-whitespace, non-'=' char means we've gone too far
+                    break;
+                }
+            }
+
+            // Find root_source_file within this createModule call body
+            const body_end = @min(source.len, cm_start + 2000);
+            const body = source[cm_start..body_end];
+
+            if (findField(body, "root_source_file", 0)) |rsf_dot_off| {
+                const after_kw = rsf_dot_off + ".root_source_file".len;
+                const val_pos = skipToValue(body, after_kw) orelse {
+                    search_pos = cm_start + "createModule(".len;
+                    continue;
+                };
+                if (extractStringValue(body, val_pos)) |rel_path| {
+                    if (var_name) |vn| {
+                        try var_to_path.append(pa, .{ .name = vn, .path = rel_path });
+                    }
+                }
+            }
+
+            search_pos = cm_start + "createModule(".len;
+        }
+    }
+
+    // Phase 2: Collect all .{ .name = "mod_name", .module = var_name } patterns
+    {
+        var search_pos: usize = 0;
+        while (search_pos < source.len) {
+            const name_dot_off = findField(source, "name", search_pos) orelse break;
+            const after_name_kw = name_dot_off + ".name".len;
+
+            const name_val_pos = skipToValue(source, after_name_kw) orelse {
+                search_pos = after_name_kw;
+                continue;
+            };
+            const imp_name = extractStringValue(source, name_val_pos) orelse {
+                search_pos = after_name_kw;
+                continue;
+            };
+
+            // Look for .module = identifier within next 300 chars
+            const after_name_val = name_val_pos + imp_name.len + 1; // +1 for closing quote
+            const look_end = @min(source.len, after_name_val + 300);
+            const window = source[after_name_val..look_end];
+
+            if (findField(window, "module", 0)) |mod_dot_off| {
+                const after_mod_kw = mod_dot_off + ".module".len;
+                const mod_val_pos = skipToValue(window, after_mod_kw) orelse {
+                    search_pos = after_name_val + mod_dot_off + 1;
+                    continue;
+                };
+                const var_ref = extractIdentValue(window, mod_val_pos) orelse {
+                    search_pos = after_name_val + mod_dot_off + 1;
+                    continue;
+                };
+
+                // Match: does imp_name == module_name?
+                if (std.mem.eql(u8, imp_name, module_name)) {
+                    // Look up var_ref in var_to_path
+                    for (var_to_path.items) |pair| {
+                        if (std.mem.eql(u8, pair.name, var_ref)) {
+                            const abs_path = try std.Io.Dir.path.join(allocator, &.{ pkg_dir, pair.path });
+                            defer allocator.free(abs_path);
+                            std.Io.Dir.cwd().access(self.io, abs_path, .{}) catch {
+                                log.debug("module '{s}': resolved path '{s}' does not exist", .{ module_name, abs_path });
+                                continue;
+                            };
+                            log.debug("resolved import '{s}' to '{s}' via createModule string search in '{s}'", .{ module_name, abs_path, build_zig_path });
+                            return try .fromPath(allocator, abs_path);
+                        }
+                    }
+                }
+            }
+
+            search_pos = after_name_kw;
+        }
+    }
+
+    // Phase 3: Also try addModule pattern via string search (covers cases where
+    // AST-based detection failed)
+    {
+        var search_pos: usize = 0;
+        while (search_pos < source.len) {
+            const am_offset = std.mem.indexOf(u8, source[search_pos..], "addModule(") orelse break;
+            const am_start = search_pos + am_offset + "addModule(".len;
+
+            // Extract first string argument (module name)
+            const q1 = std.mem.indexOf(u8, source[am_start..], "\"") orelse {
+                search_pos = am_start + 1;
+                continue;
+            };
+            const name_s = am_start + q1 + 1;
+            const q2 = std.mem.indexOf(u8, source[name_s..], "\"") orelse {
+                search_pos = name_s + 1;
+                continue;
+            };
+            const am_name = source[name_s..name_s + q2];
+
+            if (!std.mem.eql(u8, am_name, module_name)) {
+                search_pos = name_s + q2 + 1;
+                continue;
+            }
+
+            // Found matching module name, look for root_source_file in next 500 chars
+            const body_start = name_s + q2 + 1;
+            const body_end = @min(source.len, body_start + 500);
+            const body = source[body_start..body_end];
+
+            if (findField(body, "root_source_file", 0)) |rsf_dot_off| {
+                const after_kw = rsf_dot_off + ".root_source_file".len;
+                const val_pos = skipToValue(body, after_kw) orelse {
+                    search_pos = name_s + q2 + 1;
+                    continue;
+                };
+                if (extractStringValue(body, val_pos)) |rel_path| {
+                    const abs_path = try std.Io.Dir.path.join(allocator, &.{ pkg_dir, rel_path });
+                    defer allocator.free(abs_path);
+                    std.Io.Dir.cwd().access(self.io, abs_path, .{}) catch {
+                        search_pos = name_s + q2 + 1;
+                        continue;
+                    };
+                    log.debug("resolved import '{s}' to '{s}' via addModule string search in '{s}'", .{ module_name, abs_path, build_zig_path });
+                    return try .fromPath(allocator, abs_path);
+                }
+            }
+
+            search_pos = name_s + q2 + 1;
+        }
+    }
+
+    log.debug("module '{s}': string search also failed in '{s}'", .{ module_name, build_zig_path });
     return null;
 }
 
@@ -1834,21 +2103,20 @@ fn resolveZonDependency(
     };
     const base_dir = std.Io.Dir.path.dirname(handle_path) orelse return null;
 
-    // Scan up to 3 parent directories for build.zig.zon
+    // Scan up to 10 parent directories for build.zig.zon
     const zon_path = blk: {
         var search_dir = try tmp.dupe(u8, base_dir);
         var level: usize = 0;
-        while (level < 3) : (level += 1) {
+        while (level < 10) : (level += 1) {
             const candidate = try std.Io.Dir.path.join(tmp, &.{ search_dir, "build.zig.zon" });
-            if (std.Io.Dir.cwd().access(self.io, candidate, .{})) |_| {
-                break :blk try allocator.dupe(u8, candidate);
-            } else |_| {}
-
-            // Move up one directory
-            const parent = std.Io.Dir.path.dirname(search_dir) orelse break;
-            search_dir = try tmp.dupe(u8, parent);
+            std.Io.Dir.cwd().access(self.io, candidate, .{}) catch {
+                const parent = std.Io.Dir.path.dirname(search_dir) orelse break;
+                search_dir = try tmp.dupe(u8, parent);
+                continue;
+            };
+            break :blk try allocator.dupe(u8, candidate);
         }
-        log.debug("import '{s}': no build.zig.zon found within 3 parent directories of '{s}'", .{ import_str, handle_path });
+        log.debug("import '{s}': no build.zig.zon found within 10 parent directories of '{s}'", .{ import_str, handle_path });
         return null;
     };
     defer allocator.free(zon_path);
@@ -2094,49 +2362,107 @@ pub fn uriFromImportStr(
         return .{ .one = uri };
     }
 
-    // Fallback: when the build config is not available (e.g. build runner not supported),
-    // try to resolve the import by scanning the file system.
-    // This handles the common case where @import("module_name") refers to
-    // a directory or file in the project tree.
+    // Fallback: parse the project's own build.zig for addModule declarations,
+    // then scan from the project root as a secondary fallback.
+    // This handles the case where @import("module_name") refers to a module
+    // defined in the project's own build.zig via b.addModule(...), which is
+    // the common pattern for same-project subdirectory modules.
     if (handle.uri.isFileScheme()) {
         var tmp_arena: std.heap.ArenaAllocator = .init(allocator);
         defer tmp_arena.deinit();
         const tmp = tmp_arena.allocator();
 
         const handle_path = handle.uri.toFsPath(tmp) catch return .none;
-        const base_dir = std.Io.Dir.path.dirname(handle_path) orelse return .none;
+        const handle_dir = std.Io.Dir.path.dirname(handle_path) orelse return .none;
 
-        // Try looking in the current directory and up to 3 parent directories
-        var search_dir = try tmp.dupe(u8, base_dir);
-        var level: usize = 0;
-        while (level < 3) : (level += 1) {
-            // Try <search_dir>/<import_str>/main.zig
-            {
-                const candidate = try std.Io.Dir.path.join(tmp, &.{ search_dir, import_str, "main.zig" });
-                if (std.Io.Dir.cwd().access(self.io, candidate, .{})) |_| {
-                    return .{ .one = try .fromPath(allocator, candidate) };
-                } else |_| {}
+        // Phase 1: scan up to 10 parent directories to find build.zig,
+        // then parse it for addModule declarations.
+        var project_root: ?[]const u8 = null;
+        {
+            var search_dir = try tmp.dupe(u8, handle_dir);
+            var level: usize = 0;
+            while (level < 10) : (level += 1) {
+                const candidate = try std.Io.Dir.path.join(tmp, &.{ search_dir, "build.zig" });
+                std.Io.Dir.cwd().access(self.io, candidate, .{}) catch {
+                    const parent = std.Io.Dir.path.dirname(search_dir) orelse break;
+                    search_dir = try tmp.dupe(u8, parent);
+                    continue;
+                };
+                // build.zig exists — try to resolve import from it
+                if (try findModuleRootInPackage(self, allocator, search_dir, import_str)) |uri| {
+                    log.debug("resolved import '{s}' to '{s}' via addModule in project build.zig at '{s}'", .{ import_str, uri.raw, candidate });
+                    return .{ .one = uri };
+                }
+                // Fallback: string-based search for createModule + imports patterns
+                if (try findModuleRootByStringSearch(self, allocator, search_dir, import_str)) |uri| {
+                    return .{ .one = uri };
+                }
+                project_root = try tmp.dupe(u8, search_dir);
+                break;
             }
-            // Try <search_dir>/<import_str>/<import_str>.zig
-            {
-                const filename = try std.fmt.allocPrint(tmp, "{s}.zig", .{import_str});
-                const candidate = try std.Io.Dir.path.join(tmp, &.{ search_dir, import_str, filename });
-                if (std.Io.Dir.cwd().access(self.io, candidate, .{})) |_| {
-                    return .{ .one = try .fromPath(allocator, candidate) };
-                } else |_| {}
-            }
-            // Try <search_dir>/<import_str>.zig
-            {
-                const filename = try std.fmt.allocPrint(tmp, "{s}.zig", .{import_str});
-                const candidate = try std.Io.Dir.path.join(tmp, &.{ search_dir, filename });
-                if (std.Io.Dir.cwd().access(self.io, candidate, .{})) |_| {
-                    return .{ .one = try .fromPath(allocator, candidate) };
-                } else |_| {}
-            }
+        }
 
-            // Move up one directory
-            const parent = std.Io.Dir.path.dirname(search_dir) orelse break;
-            search_dir = try tmp.dupe(u8, parent);
+        // Phase 2: if build.zig parsing didn't resolve it, scan the filesystem
+        // starting from the project root (if found) and from the current file's
+        // directory. This covers the case where the module root file doesn't
+        // match what build.zig declares, or build.zig can't be parsed.
+        // We also scan common source subdirectories (src/, lib/) within the
+        // project root, because modules are typically defined there.
+        const src_subdirs = [_][]const u8{ "src", "lib", "source", "pkg" };
+
+        var scan_dirs_buf: [1 + src_subdirs.len + 1]?[]const u8 = undefined;
+        var scan_dirs_len: usize = 0;
+        if (project_root) |root| {
+            scan_dirs_buf[scan_dirs_len] = root;
+            scan_dirs_len += 1;
+            for (src_subdirs) |subdir| {
+                const sub_path = try std.Io.Dir.path.join(tmp, &.{ root, subdir });
+                std.Io.Dir.cwd().access(self.io, sub_path, .{}) catch continue;
+                scan_dirs_buf[scan_dirs_len] = try tmp.dupe(u8, sub_path);
+                scan_dirs_len += 1;
+            }
+        }
+        // Also include the current file's directory (if not already the project root)
+        if (project_root == null or !std.mem.eql(u8, project_root.?, handle_dir)) {
+            scan_dirs_buf[scan_dirs_len] = handle_dir;
+            scan_dirs_len += 1;
+        }
+
+        for (scan_dirs_buf[0..scan_dirs_len]) |maybe_dir| {
+            const dir = maybe_dir orelse continue;
+            // Scan up to 10 levels from this directory
+            var search_dir = try tmp.dupe(u8, dir);
+            var level: usize = 0;
+            while (level < 10) : (level += 1) {
+                // Try <dir>/<import_str>/main.zig
+                {
+                    const candidate = try std.Io.Dir.path.join(tmp, &.{ search_dir, import_str, "main.zig" });
+                    std.Io.Dir.cwd().access(self.io, candidate, .{}) catch {
+                        continue;
+                    };
+                    return .{ .one = try .fromPath(allocator, candidate) };
+                }
+                // Try <dir>/<import_str>/<import_str>.zig
+                {
+                    const filename = try std.fmt.allocPrint(tmp, "{s}.zig", .{import_str});
+                    const candidate = try std.Io.Dir.path.join(tmp, &.{ search_dir, import_str, filename });
+                    std.Io.Dir.cwd().access(self.io, candidate, .{}) catch {
+                        continue;
+                    };
+                    return .{ .one = try .fromPath(allocator, candidate) };
+                }
+                // Try <dir>/<import_str>.zig
+                {
+                    const filename = try std.fmt.allocPrint(tmp, "{s}.zig", .{import_str});
+                    const candidate = try std.Io.Dir.path.join(tmp, &.{ search_dir, filename });
+                    std.Io.Dir.cwd().access(self.io, candidate, .{}) catch {
+                        continue;
+                    };
+                    return .{ .one = try .fromPath(allocator, candidate) };
+                }
+                const parent = std.Io.Dir.path.dirname(search_dir) orelse break;
+                search_dir = try tmp.dupe(u8, parent);
+            }
         }
     }
 

@@ -1144,7 +1144,7 @@ pub fn init(io: std.Io, gpa: Allocator) Allocator.Error!InternPool {
 
     try ip.map.ensureTotalCapacity(gpa, items.len);
     try ip.items.ensureTotalCapacity(gpa, items.len);
-    if (builtin.is_test or builtin.mode == .debug) {
+    if (builtin.is_test or builtin.mode == .Debug) {
         // detect wrong value for extra_count
         try ip.extra.ensureTotalCapacityPrecise(gpa, extra_count);
     } else {
@@ -1896,7 +1896,7 @@ fn coerceInt(
 }
 
 pub fn resolvePeerTypes(ip: *InternPool, types: []const Index, target: std.Target) Allocator.Error!Index {
-    if (builtin.mode == .debug) {
+    if (builtin.mode == .Debug) {
         for (types) |ty| {
             assert(ip.isType(ty));
         }
