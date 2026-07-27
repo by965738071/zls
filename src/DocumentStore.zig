@@ -1940,9 +1940,10 @@ fn findModuleRootByStringSearch(
                         }
                         break;
                     }
-                    // Skip whitespace (including newlines) when searching for '='
-                    if (std.ascii.isWhitespace(c)) continue;
-                    // Any other non-whitespace, non-'=' char means we've gone too far
+                    // Skip whitespace, identifier chars, and '.' when searching
+                    // for '=' (e.g., walk past "b." in "b.createModule")
+                    if (std.ascii.isWhitespace(c) or isIdentChar(c) or c == '.') continue;
+                    // Any other char (e.g., ';', '(', '{') means no assignment
                     break;
                 }
             }
