@@ -1,4 +1,4 @@
-//! - Store global state
+﻿//! - Store global state
 //! - The main loop
 //! - Job/Request scheduling
 //! - many Request handlers defined here. Except for the major ones which are in `src/features`
@@ -1089,12 +1089,12 @@ pub fn resolveConfiguration(server: *Server) error{ Canceled, OutOfMemory }!void
             // `--build-runner` flag was removed in Zig 0.17.0-dev, so this branch is hit
             // regardless of the actual Zig version. The message must not claim that the
             // Zig version is outdated.
-            server.showMessage(
-                .Warning,
-                "ZLS '{f}': the build runner is unavailable with Zig '{f}' (the '--build-runner' flag was removed). " ++
-                    "Build-aware features will fall back to heuristics (minimum Zig version for the build runner was '{s}').",
-                .{ zls_version, zig_version, build_options.minimum_runtime_zig_version_string },
-            );
+            // server.showMessage(
+            //     .Warning,
+            //     "ZLS '{f}': the build runner is unavailable with Zig '{f}' (the '--build-runner' flag was removed). " ++
+            //         "Build-aware features will fall back to heuristics (minimum Zig version for the build runner was '{s}').",
+            //     .{ zls_version, zig_version, build_options.minimum_runtime_zig_version_string },
+            // );
         }
     }
 
