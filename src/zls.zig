@@ -37,4 +37,5 @@ pub const workspace_symbols = @import("features/workspace_symbols.zig");
 comptime {
     const std = @import("std");
     std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(@import("bsp.zig"));
 }
